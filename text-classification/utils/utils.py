@@ -3,8 +3,8 @@ import numpy as np
 import re
 import collections
 import random
-from sklearn import metrics
 from nltk.corpus import stopwords
+from sklearn.model_selection import train_test_split
 
 english_stopwords = stopwords.words('english')
 
@@ -33,7 +33,8 @@ def separate_dataset(trainset, ratio=0.5):
     return datastring, datatarget
 
 
-def build_dataset(words, n_words):
+def build_dataset(words):
+    n_words = len(list(set(words)))
     count = [['GO', 0], ['PAD', 1], ['EOS', 2], ['UNK', 3]]
     count.extend(collections.Counter(words).most_common(n_words - 1))
     dictionary = dict()
@@ -48,7 +49,7 @@ def build_dataset(words, n_words):
         data.append(index)
     count[0][1] = unk_count
     reversed_dictionary = dict(zip(dictionary.values(), dictionary.keys()))
-    return data, count, dictionary, reversed_dictionary
+    return data, count, dictionary, reversed_dictionary, n_words
 
 
 def str_idx(corpus, dic, maxlen, UNK=3):
@@ -57,3 +58,16 @@ def str_idx(corpus, dic, maxlen, UNK=3):
         for no, k in enumerate(corpus[i].split()[:maxlen][::-1]):
             X[i, -1 - no] = dic.get(k, UNK)
     return X
+
+
+def get_train_test():
+    trainset = sklearn.datasets.load_files(container_path='dataset', encoding='UTF-8')
+    trainset.data, trainset.target = separate_dataset(trainset, 1.0)
+
+    ONEHOT = np.zeros((len(trainset.data), len(trainset.target_names)))
+    ONEHOT[np.arange(len(trainset.data)), trainset.target] = 1.0
+    train_X, test_X, train_Y, test_Y, train_onehot, test_onehot = train_test_split(trainset.data,
+                                                                                   trainset.target,
+                                                                                   ONEHOT, test_size=0.2)
+
+    return trainset, train_X, test_X, train_Y, test_Y, train_onehot, test_onehot
