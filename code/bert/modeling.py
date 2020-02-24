@@ -27,6 +27,16 @@ import numpy as np
 import six
 import tensorflow as tf
 
+"""
+Masked LM: 
+    1、在训练过程中作者随机mask 15%的token, 而不是把像cbow一样把每个词都预测一遍, 最终的损失函数只计算被mask掉的那个token.
+    2、因为序列长度太大(512)会影响训练速度，所以90%的steps都是用seq_len=128来训练, 余下的10%步数训练512长度的输入
+    3、Masked LM预训练阶段模型是不知道真正被mask的是哪个词的，所以模型对每个词都要关注
+    
+Next Sentence Prediction:
+    1、作者特意说了语料的选取很重要, 要选用document-level的而不是sentence-level的，这样可以具备连续序列特征的能力
+"""
+
 
 # 配置类
 class BertConfig(object):
@@ -167,14 +177,27 @@ class BertModel(object):
 
         Args:
           config: `BertConfig` instance.
+
+
           is_training: bool. true for training model, false for eval model. Controls
             whether dropout will be applied.
+
+
           input_ids: int32 Tensor of shape [batch_size, seq_length].
+
+
           input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
+
+
           token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
+
+
           use_one_hot_embeddings: (optional) bool. Whether to use one-hot word
             embeddings or tf.embedding_lookup() for the word embeddings.
+
+
           scope: (optional) variable scope. Defaults to "bert".
+
 
         Raises:
           ValueError: The config is invalid or one of the input tensor shapes
@@ -632,12 +655,41 @@ def embedding_postprocessor(input_tensor,  # [batch_size, seq_length, embedding_
     return output
 
 
-# 构造attention_mask
+# 构造attention_mask 构造Mask矩阵
 def create_attention_mask_from_input_mask(from_tensor, to_mask):
     """
     Create 3D attention mask from a 2D tensor mask.
 
-    Masked LM预训练阶段模型是不知道真正被mask的是哪个词的，所以模型对每个词都要关注
+    比如调用它时的两个参数是:
+        input_ids=[     # 两个样本
+            [1,2,3,0,0],
+            [1,3,5,6,1]
+        ]
+        input_mask=[
+            [1,1,1,0,0],
+            [1,1,1,1,1]
+        ]
+
+    表示这个batch有两个样本, 第一个样本长度为3(padding了2个0), 第二个样本长度为5.
+    在计算self-Attention的时候每一个样本都需要一个Attention Mask矩阵,表示每一个时刻可以attend to 的范围,
+    1表示可以attend to, 0表示是padding的（或者在机器翻译的Decoder中不能attend to未来的词）.
+    对于上面的输入, 这个函数返回一个shape是[2, 5, 5]->(计算过程: [2, 5, 1] * [2, 1, 5] = [2, 5, 5])的tensor，
+    分别代表来两个Attention Mask矩阵。
+        [
+            [1, 1, 1, 0, 0], #它表示第1个词可以attend to 3个词
+            [1, 1, 1, 0, 0], #它表示第2个词可以attend to 3个词
+            [1, 1, 1, 0, 0], #它表示第3个词可以attend to 3个词
+            [1, 1, 1, 0, 0], #无意义，因为输入第4个词是padding的0
+            [1, 1, 1, 0, 0]  #无意义，因为输入第5个词是padding的0
+        ]
+
+        [
+            [1, 1, 1, 1, 1], # 它表示第1个词可以attend to 5个词
+            [1, 1, 1, 1, 1], # 它表示第2个词可以attend to 5个词
+            [1, 1, 1, 1, 1], # 它表示第3个词可以attend to 5个词
+            [1, 1, 1, 1, 1], # 它表示第4个词可以attend to 5个词
+            [1, 1, 1, 1, 1]	 # 它表示第5个词可以attend to 5个词
+        ]
 
     Args:
       from_tensor: 2D or 3D Tensor of shape [batch_size, from_seq_length, ...].
@@ -653,23 +705,24 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
     to_shape = get_shape_list(to_mask, expected_rank=2)
     to_seq_length = to_shape[1]
 
-    to_mask = tf.cast(
-        tf.reshape(to_mask, [batch_size, 1, to_seq_length]), tf.float32)
+    to_mask = tf.cast(tf.reshape(to_mask, [batch_size, 1, to_seq_length]), tf.float32)
 
     # We don't assume that `from_tensor` is a mask (although it could be). We
     # don't actually care if we attend *from* padding tokens (only *to* padding)
     # tokens so we create a tensor of all ones.
     #
     # `broadcast_ones` = [batch_size, from_seq_length, 1]
-    broadcast_ones = tf.ones(
-        shape=[batch_size, from_seq_length, 1], dtype=tf.float32)
+    broadcast_ones = tf.ones(shape=[batch_size, from_seq_length, 1], dtype=tf.float32)
 
     # Here we broadcast along two dimensions to create the mask.
+    # [batch_size, from_seq_length, 1] * [batch_size, 1, to_seq_length] = [batch_size, from_seq_length, to_seq_length]
+
     mask = broadcast_ones * to_mask
 
     return mask
 
 
+# 注意力层
 def attention_layer(from_tensor,
                     to_tensor,
                     attention_mask=None,
@@ -681,56 +734,131 @@ def attention_layer(from_tensor,
                     attention_probs_dropout_prob=0.0,
                     initializer_range=0.02,
                     do_return_2d_tensor=False,
+
                     batch_size=None,
                     from_seq_length=None,
                     to_seq_length=None):
-    """Performs multi-headed attention from `from_tensor` to `to_tensor`.
+    """
+    Performs multi-headed attention from `from_tensor` to `to_tensor`.
+    multi-head attention的实现
+
+    ‘今天很美好‘
+    当我们希望计算'今天'这个单词和其他单词的Attention-score的时候，则取出“今天”对应的
+    Query, 与所有单词对应的key做点乘，结果经softmax归一化之后，与各个单词对应的value
+    相乘，即可产生不同权重的结果，最终结果为output的加和。
+
+    用`from_tensor`(作为Query)去attend to `to_tensor`(提供Key和Value)
+    也就是用from的Query去乘以所有to的Key，softmax后得到weight，然后把所有to的Value加权求和起来。
+
+    考虑key-query-value形式的attention，输入的from_tensor当做是query，
+    to_tensor当做是key和value，当两者相同的时候即为self-attention。
+
+    这个函数首先把`from_tensor`变换成一个"query" tensor，
+    然后把`to_tensor`变成"key"和"value" tensors。
+    总共有`num_attention_heads`组Query、Key和Value，
+    每一个Query，Key和Value的shape都是[batch_size(8), seq_length(128), size_per_head(512/8=64)].
+
+    然后计算query和key的内积并且除以size_per_head的平方根(8)。
+    然后softmax变成概率，最后用概率加权value得到输出。
+    因为有多个Head，每个Head都输出[batch_size, seq_length, size_per_head]，
+    最后把8个Head的结果concat起来，就最终得到[batch_size(8), seq_length(128), size_per_head*8=512]
+
+    实际上我们是把这8个Head的Query，Key和Value都放在一个Tensor里面的，
+    因此实际通过transpose和reshape就达到了上面的效果。
+
+    attention layer的主要流程：
+    1、对输入的tensor进行形状校验，提取batch_size、from_seq_length 、to_seq_length
+    2、输入如果是3d张量则转化成2d矩阵
+    3、from_tensor作为query， to_tensor作为key和value，经过一层全连接层后得到query_layer、key_layer 、value_layer
+    4、将上述张量通过transpose_for_scores转化成multi-head
+    5、根据论文公式计算attention_score以及attention_probs（注意attention_mask的trick）：
+
+    将得到的attention_probs与value相乘，返回2D或3D张量
 
     This is an implementation of multi-headed attention based on "Attention
     is all you Need". If `from_tensor` and `to_tensor` are the same, then
     this is self-attention. Each timestep in `from_tensor` attends to the
     corresponding sequence in `to_tensor`, and returns a fixed-with vector.
 
+    “ from_tensor”中的每个时间步都遵循“ to_tensor”中的相应序列，并返回固定向量。
+
     This function first projects `from_tensor` into a "query" tensor and
     `to_tensor` into "key" and "value" tensors. These are (effectively) a list
     of tensors of length `num_attention_heads`, where each tensor is of shape
     [batch_size, seq_length, size_per_head].
+    该函数首先将from_tensor投影到“查询”张量中，将to_tensor投影到“键”和“值”张量中。
+    这些（有效地）是长度为num_attention_heads`的张量的列表，
+    其中每个张量的形状为[batch_size，seq_length，size_per_head]。
 
     Then, the query and key tensors are dot-producted and scaled. These are
     softmaxed to obtain attention probabilities. The value tensors are then
     interpolated by these probabilities, then concatenated back to a single
     tensor and returned.
+    然后，对查询张量 和 键张量 进行点乘和缩放。 这些被最大化以获得关注概率。
+    然后，通过这些概率对值张量进行插值，然后将其连接回单个张量并返回。
 
     In practice, the multi-headed attention are done with transposes and
     reshapes rather than actual separate tensors.
+    实际上，多头注意力是通过转置和重塑而不是实际的单独张量来完成的。
 
     Args:
       from_tensor: float Tensor of shape [batch_size, from_seq_length,
         from_width].
+        【batch_size, from_seq_length, from_width】
+
       to_tensor: float Tensor of shape [batch_size, to_seq_length, to_width].
+        【batch_size, to_seq_length, to_width】
+
       attention_mask: (optional) int32 Tensor of shape [batch_size,
         from_seq_length, to_seq_length]. The values should be 1 or 0. The
         attention scores will effectively be set to -infinity for any positions in
         the mask that are 0, and will be unchanged for positions that are 1.
+        【batch_size,from_seq_length, to_seq_length】
+        值可以是0或者1，在计算attention score的时候，
+        我们会把0变成负无穷(实际是一个绝对值很大的负数)，而1不变，
+        这样softmax的时候进行exp的计算，前者就趋近于零，从而间接实现Mask的功能。
+
+
       num_attention_heads: int. Number of attention heads.
+        attention head numbers
+
       size_per_head: int. Size of each attention head.
+        每个head的大小
+
       query_act: (optional) Activation function for the query transform.
+        query变换的激活函数
+
       key_act: (optional) Activation function for the key transform.
+        key变换的激活函数
+
       value_act: (optional) Activation function for the value transform.
+        value变换的激活函数
+
       attention_probs_dropout_prob: (optional) float. Dropout probability of the
         attention probabilities.
+        attention层的dropout
+
       initializer_range: float. Range of the weight initializer.
+        初始化取值范围
+
       do_return_2d_tensor: bool. If True, the output will be of shape [batch_size
         * from_seq_length, num_attention_heads * size_per_head]. If False, the
         output will be of shape [batch_size, from_seq_length, num_attention_heads
         * size_per_head].
+        是否返回2d张量。如果True，输出形状【batch_size*from_seq_length, num_attention_heads*size_per_head】
+        如果False，输出形状【batch_size, from_seq_length, num_attention_heads*size_per_head】
+
       batch_size: (Optional) int. If the input is 2D, this might be the batch size
         of the 3D version of the `from_tensor` and `to_tensor`.
+        如果输入是3D的那么batch就是第一维，但是可能3D的压缩成了2D的，所以需要告诉函数batch_size
+
       from_seq_length: (Optional) If the input is 2D, this might be the seq length
         of the 3D version of the `from_tensor`.
+        如果输入是3D的那么batch就是第一维，但是可能3D的压缩成了2D的，所以需要告诉函数batch_size
+
       to_seq_length: (Optional) If the input is 2D, this might be the seq length
         of the 3D version of the `to_tensor`.
-
+        如果输入是3D的那么batch就是第一维，但是可能3D的压缩成了2D的，所以需要告诉函数batch_size
     Returns:
       float Tensor of shape [batch_size, from_seq_length,
         num_attention_heads * size_per_head]. (If `do_return_2d_tensor` is
@@ -741,12 +869,12 @@ def attention_layer(from_tensor,
       ValueError: Any of the arguments or tensor shapes are invalid.
     """
 
-    def transpose_for_scores(input_tensor, batch_size, num_attention_heads,
-                             seq_length, width):
-        output_tensor = tf.reshape(
-            input_tensor, [batch_size, seq_length, num_attention_heads, width])
+    # reshape并且转置维度
+    def transpose_for_scores(input_tensor, batch_size, num_attention_heads, seq_length, width):
+        output_tensor = tf.reshape(input_tensor, [batch_size, seq_length, num_attention_heads, width])
 
         output_tensor = tf.transpose(output_tensor, [0, 2, 1, 3])
+
         return output_tensor
 
     from_shape = get_shape_list(from_tensor, expected_rank=[2, 3])
@@ -761,61 +889,65 @@ def attention_layer(from_tensor,
         from_seq_length = from_shape[1]
         to_seq_length = to_shape[1]
     elif len(from_shape) == 2:
-        if (batch_size is None or from_seq_length is None or to_seq_length is None):
+        if batch_size is None or from_seq_length is None or to_seq_length is None:
             raise ValueError(
                 "When passing in rank 2 tensors to attention_layer, the values "
                 "for `batch_size`, `from_seq_length`, and `to_seq_length` "
                 "must all be specified.")
 
-    # Scalar dimensions referenced here:
-    #   B = batch size (number of sequences)
-    #   F = `from_tensor` sequence length
-    #   T = `to_tensor` sequence length
-    #   N = `num_attention_heads`
-    #   H = `size_per_head`
+    # Scalar dimensions referenced here [为了方便备注shape，采用以下简写]:
+    #   B = batch size (number of sequences) 默认配置是8
+    #   F = `from_tensor` sequence length  默认配置是128
+    #   T = `to_tensor` sequence length 默认配置是128
+    #   N = `num_attention_heads` 默认配置是12
+    #   H = `size_per_head` 默认配置是64
 
-    from_tensor_2d = reshape_to_matrix(from_tensor)
-    to_tensor_2d = reshape_to_matrix(to_tensor)
+    # 把from_tensor和to_tensor压缩成2D张量
+    from_tensor_2d = reshape_to_matrix(from_tensor)  # 【B*F, hidden_size】
+    to_tensor_2d = reshape_to_matrix(to_tensor)  # 【B*T, hidden_size】
 
+    #  将from_tensor输入全连接层得到query_layer
     # `query_layer` = [B*F, N*H]
     query_layer = tf.layers.dense(
-        from_tensor_2d,
-        num_attention_heads * size_per_head,
+        inputs=from_tensor_2d,
+        units=num_attention_heads * size_per_head,
         activation=query_act,
         name="query",
         kernel_initializer=create_initializer(initializer_range))
 
     # `key_layer` = [B*T, N*H]
     key_layer = tf.layers.dense(
-        to_tensor_2d,
-        num_attention_heads * size_per_head,
+        inputs=to_tensor_2d,
+        units=num_attention_heads * size_per_head,
         activation=key_act,
         name="key",
         kernel_initializer=create_initializer(initializer_range))
 
     # `value_layer` = [B*T, N*H]
     value_layer = tf.layers.dense(
-        to_tensor_2d,
-        num_attention_heads * size_per_head,
+        inputs=to_tensor_2d,
+        units=num_attention_heads * size_per_head,
         activation=value_act,
         name="value",
         kernel_initializer=create_initializer(initializer_range))
 
-    # `query_layer` = [B, N, F, H]
+    # `query_layer` = [B, N, F, H]  query_layer转成多头：[B*F, N*H]==>[B, F, N, H]==>[B, N, F, H]
     query_layer = transpose_for_scores(query_layer, batch_size,
                                        num_attention_heads, from_seq_length,
                                        size_per_head)
 
-    # `key_layer` = [B, N, T, H]
+    # `key_layer` = [B, N, T, H]  key_layer转成多头：[B*T, N*H] ==> [B, T, N, H] ==> [B, N, T, H]
     key_layer = transpose_for_scores(key_layer, batch_size, num_attention_heads,
                                      to_seq_length, size_per_head)
 
     # Take the dot product between "query" and "key" to get the raw
+    # 将query与key做点积，然后做一个scale
     # attention scores.
-    # `attention_scores` = [B, N, F, T]
+    # `attention_scores` = [B, N, F, T]   [B, N, F, H] * [B, N, T, H].T = [B, N, F, T]
+    # 最后两维[F(128), T(128)]表示from的128个时刻attend to到to的128个score。
     attention_scores = tf.matmul(query_layer, key_layer, transpose_b=True)
-    attention_scores = tf.multiply(attention_scores,
-                                   1.0 / math.sqrt(float(size_per_head)))
+    # 两个矩阵中对应元素各自相乘
+    attention_scores = tf.multiply(attention_scores, 1.0 / math.sqrt(float(size_per_head)))
 
     if attention_mask is not None:
         # `attention_mask` = [B, 1, F, T]
@@ -824,16 +956,23 @@ def attention_layer(from_tensor,
         # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
         # masked positions, this operation will create a tensor which is 0.0 for
         # positions we want to attend and -10000.0 for masked positions.
+
+        # 如果attention_mask里的元素为1，则通过下面运算有（1-1）*-10000，adder就是0
+        # 如果attention_mask里的元素为0，则通过下面运算有（1-0）*-10000，adder就是-10000
         adder = (1.0 - tf.cast(attention_mask, tf.float32)) * -10000.0
 
         # Since we are adding it to the raw scores before the softmax, this is
         # effectively the same as removing these entirely.
+        # 我们最终得到的attention_score一般不会很大，
+        # 所以上述操作对mask为0的地方得到的score可以认为是负无穷
         attention_scores += adder
 
+    # 负无穷经过softmax之后为0，就相当于mask为0的位置不计算attention_score
     # Normalize the attention scores to probabilities.
     # `attention_probs` = [B, N, F, T]
     attention_probs = tf.nn.softmax(attention_scores)
 
+    # 对attention_probs进行dropout，这虽然有点奇怪，但是Transforme原始论文就是这么做的
     # This is actually dropping out entire tokens to attend to, which might
     # seem a bit unusual, but is taken from the original Transformer paper.
     attention_probs = dropout(attention_probs, attention_probs_dropout_prob)
@@ -847,6 +986,7 @@ def attention_layer(from_tensor,
     value_layer = tf.transpose(value_layer, [0, 2, 1, 3])
 
     # `context_layer` = [B, N, F, H]
+    # 加权计算
     context_layer = tf.matmul(attention_probs, value_layer)
 
     # `context_layer` = [B, F, N, H]
@@ -866,6 +1006,7 @@ def attention_layer(from_tensor,
     return context_layer
 
 
+# Transformer
 def transformer_model(input_tensor,
                       attention_mask=None,
                       hidden_size=768,
@@ -877,7 +1018,8 @@ def transformer_model(input_tensor,
                       attention_probs_dropout_prob=0.1,
                       initializer_range=0.02,
                       do_return_all_layers=False):
-    """Multi-headed, multi-layer Transformer from "Attention is All You Need".
+    """
+    Multi-headed, multi-layer Transformer from "Attention is All You Need".
 
     This is almost an exact implementation of the original Transformer encoder.
 
@@ -889,31 +1031,60 @@ def transformer_model(input_tensor,
 
     Args:
       input_tensor: float Tensor of shape [batch_size, seq_length, hidden_size].
+        float Tensor，shape为[batch_size, seq_length, hidden_size]
+
       attention_mask: (optional) int32 Tensor of shape [batch_size, seq_length,
         seq_length], with 1 for positions that can be attended to and 0 in
         positions that should not be.
+        (可选) int32 Tensor，shape [batch_size, seq_length, seq_length], 1表示可以attend to，0表示不能。
+
       hidden_size: int. Hidden size of the Transformer.
+        Transformer隐单元个数
+
       num_hidden_layers: int. Number of layers (blocks) in the Transformer.
+        有多少个SubLayer
+
       num_attention_heads: int. Number of attention heads in the Transformer.
+        Transformer Attention Head个数。
+
       intermediate_size: int. The size of the "intermediate" (a.k.a., feed
         forward) layer.
+        全连接层的隐单元个数
+
       intermediate_act_fn: function. The non-linear activation function to apply
         to the output of the intermediate/feed-forward layer.
+        函数. 全连接层的激活函数。
+
       hidden_dropout_prob: float. Dropout probability for the hidden layers.
+        float. Self-Attention层残差之前的Dropout概率
+
       attention_probs_dropout_prob: float. Dropout probability of the attention
         probabilities.
+        float. attention的Dropout概率
+
       initializer_range: float. Range of the initializer (stddev of truncated
         normal).
+        初始化范围(truncated normal的标准差)
+
       do_return_all_layers: Whether to also return all layers or just the final
         layer.
+        返回所有层的输出还是最后一层的输出。
 
     Returns:
       float Tensor of shape [batch_size, seq_length, hidden_size], the final
       hidden layer of the Transformer.
+      如果do_return_all_layers True，返回最后一层的输出，是一个Tensor，
+      shape为[batch_size, seq_length, hidden_size]；
+
+      否则返回所有层的输出，是一个长度为num_hidden_layers的list，
+      list的每一个元素都是[batch_size, seq_length, hidden_size]。
 
     Raises:
       ValueError: A Tensor shape or parameter is invalid.
     """
+    # 这里注意，因为最终要输出hidden_size， 我们有num_attention_head个区域，
+    # 每个head区域有size_per_head多的隐层
+    # 所以有 hidden_size = num_attention_head * size_per_head
     if hidden_size % num_attention_heads != 0:
         raise ValueError(
             "The hidden size (%d) is not a multiple of the number of attention "
@@ -927,6 +1098,7 @@ def transformer_model(input_tensor,
 
     # The Transformer performs sum residuals on all layers so the input needs
     # to be the same as the hidden size.
+    # 因为encoder中有残差操作，所以需要shape相同
     if input_width != hidden_size:
         raise ValueError("The width of the input tensor (%d) != hidden size (%d)" %
                          (input_width, hidden_size))
@@ -935,6 +1107,8 @@ def transformer_model(input_tensor,
     # forth from a 3D tensor to a 2D tensor. Re-shapes are normally free on
     # the GPU/CPU but may not be free on the TPU, so we want to minimize them to
     # help the optimizer.
+    # reshape操作在CPU/GPU上很快，但是在TPU上很不友好
+    # 所以为了避免2D和3D之间的频繁reshape，我们把所有的3D张量用2D矩阵表示
     prev_output = reshape_to_matrix(input_tensor)
 
     all_layer_outputs = []
@@ -965,10 +1139,13 @@ def transformer_model(input_tensor,
                 else:
                     # In the case where we have other sequences, we just concatenate
                     # them to the self-attention head before the projection.
+                    # 如果有多个head，将他们拼接起来
                     attention_output = tf.concat(attention_heads, axis=-1)
 
                 # Run a linear projection of `hidden_size` then add a residual
                 # with `layer_input`.
+                # 对attention的输出进行线性映射, 目的是将shape变成与input一致
+                # 然后dropout+residual+norm
                 with tf.variable_scope("output"):
                     attention_output = tf.layers.dense(
                         attention_output,
@@ -986,6 +1163,8 @@ def transformer_model(input_tensor,
                     kernel_initializer=create_initializer(initializer_range))
 
             # Down-project back to `hidden_size` then add the residual.
+            # 对feed-forward层的输出使用线性变换变回‘hidden_size’
+            # 然后dropout + residual + norm
             with tf.variable_scope("output"):
                 layer_output = tf.layers.dense(
                     intermediate_output,
@@ -1049,8 +1228,12 @@ def get_shape_list(tensor, expected_rank=None, name=None):
     return shape
 
 
+# 将input_tensor压缩成2D张量
 def reshape_to_matrix(input_tensor):
-    """Reshapes a >= rank 2 tensor to a rank 2 tensor (i.e., a matrix)."""
+    """
+        Reshapes a >= rank 2 tensor to a rank 2 tensor (i.e., a matrix).
+        将> =等级2张量重整为等级2张量（即矩阵）。
+    """
     ndims = input_tensor.shape.ndims
     if ndims < 2:
         raise ValueError("Input tensor must have at least rank 2. Shape = %s" %
@@ -1060,11 +1243,16 @@ def reshape_to_matrix(input_tensor):
 
     width = input_tensor.shape[-1]
     output_tensor = tf.reshape(input_tensor, [-1, width])
+
     return output_tensor
 
 
+# 将等级2张量重整为原始等级> = 2张量。
 def reshape_from_matrix(output_tensor, orig_shape_list):
-    """Reshapes a rank 2 tensor back to its original rank >= 2 tensor."""
+    """
+        Reshapes a rank 2 tensor back to its original rank >= 2 tensor.
+        将等级2张量重整为原始等级> = 2张量。
+    """
     if len(orig_shape_list) == 2:
         return output_tensor
 
@@ -1076,10 +1264,9 @@ def reshape_from_matrix(output_tensor, orig_shape_list):
     return tf.reshape(output_tensor, orig_dims + [width])
 
 
+# 判断tensor的秩是否等于expected_rank
 def assert_rank(tensor, expected_rank, name=None):
     """
-    SEE
-
     Raises an exception if the tensor rank is not of the expected rank.
     如果张量等级不属于期望等级，则引发异常。
 
