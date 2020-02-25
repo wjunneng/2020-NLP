@@ -368,8 +368,14 @@ class BertModel(object):
         return self.embedding_table
 
 
+# gelu激活函数
 def gelu(x):
-    """Gaussian Error Linear Unit.
+    """
+    Gaussian Error Linear Unit.
+       高斯误差线性单元
+
+       与ReLU的不同：GELU为其按照输入的magnitude（等级）为inputs加权值的；
+       ReLUs是根据inputs的sign（正负）来gate（加门限）的。
 
     This is a smoother version of the RELU.
     Original paper: https://arxiv.org/abs/1606.08415
@@ -378,14 +384,18 @@ def gelu(x):
 
     Returns:
       `x` with the GELU activation applied.
+
+      对公式中的正态分布的累积分布函数进行了tanh三阶多项式近似，取得了相较于swish用sigmoid近似更好的效果。
+      累积分布函数是指随机变量X小于或等于x的概率
     """
-    cdf = 0.5 * (1.0 + tf.tanh(
-        (np.sqrt(2 / np.pi) * (x + 0.044715 * tf.pow(x, 3)))))
+    cdf = 0.5 * (1.0 + tf.tanh((np.sqrt(2 / np.pi) * (x + 0.044715 * tf.pow(x, 3)))))
     return x * cdf
 
 
+# 激活函数
 def get_activation(activation_string):
-    """Maps a string to a Python function, e.g., "relu" => `tf.nn.relu`.
+    """
+    Maps a string to a Python function, e.g., "relu" => `tf.nn.relu`.
 
     Args:
       activation_string: String name of the activation function.
@@ -1242,10 +1252,9 @@ def transformer_model(input_tensor,
         return final_output
 
 
+# 获取张量形状的列表
 def get_shape_list(tensor, expected_rank=None, name=None):
     """
-    SEE
-
     Returns a list of the shape of tensor, preferring static dimensions.
     返回张量形状的列表，首选静态尺寸。
 

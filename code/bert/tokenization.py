@@ -24,6 +24,14 @@ import unicodedata
 import six
 import tensorflow as tf
 
+"""
+tokenization.py是对原始文本语料的处理，分为BasicTokenizer和WordpieceTokenizer两类。
+
+1、分词（tokenization.py）
+2、训练数据生成（create_pretraining_data.py）
+
+"""
+
 
 def validate_case_matches_checkpoint(do_lower_case, init_checkpoint):
     """Checks whether the casing config is consistent with the checkpoint name."""
@@ -182,8 +190,11 @@ class FullTokenizer(object):
         return convert_by_vocab(self.inv_vocab, ids)
 
 
+# BasicTokenizer: 根据空格，标点进行普通的分词，最后返回的是关于词的列表，对于中文而言是关于字的列表。
 class BasicTokenizer(object):
-    """Runs basic tokenization (punctuation splitting, lower casing, etc.)."""
+    """
+        Runs basic tokenization (punctuation splitting, lower casing, etc.).
+    """
 
     def __init__(self, do_lower_case=True):
         """Constructs a BasicTokenizer.
