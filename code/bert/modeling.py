@@ -35,10 +35,21 @@ Masked LM:
     
 Next Sentence Prediction:
     1、作者特意说了语料的选取很重要, 要选用document-level的而不是sentence-level的，这样可以具备连续序列特征的能力
+    
+embedding --> N *【multi-head attention --> Add(Residual: 剩余的) &Norm--> 
+                    Feed-Forward --> Add(ResidualResidual: 剩余的) &Norm】    
+1. 配置类（BertConfig）
+2. 获取词向量（Embedding_lookup）
+3. 词向量的后续处理（embedding_postprocessor）
+4. 构造attention_mask
+5. 注意力层（attention layer）
+6. Transformer
+7. 函数入口（init）
+
 """
 
 
-# 配置类
+# 1、配置类 主要定义了BERT模型的一些默认参数，另外包括了一些文件处理函数。
 class BertConfig(object):
     """
     Configuration for `BertModel`.
@@ -141,6 +152,7 @@ class BertConfig(object):
         return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
 
+# 7、函数入口(init)
 class BertModel(object):
     """BERT model ("Bidirectional Encoder Representations from Transformers").
 
@@ -148,18 +160,32 @@ class BertModel(object):
 
     ```python
     # Already been converted into WordPiece token ids
+    # 假设输入已经分词并且变成WordPiece的id了   # 输入是[2, 3]，表示batch=2，max_seq_length=3
     input_ids = tf.constant([[31, 51, 99], [15, 5, 0]])
+
+     # 第一个例子实际长度为3，第二个例子长度为2
     input_mask = tf.constant([[1, 1, 1], [1, 1, 0]])
+
+    # 第一个例子的3个Token中前两个属于句子1，第三个属于句子2
+    # 而第二个例子的第一个Token属于句子1，第二个属于句子2(第三个是padding)
     token_type_ids = tf.constant([[0, 0, 1], [0, 2, 0]])
 
+    # 创建一个BertConfig，词典大小是32000，Transformer的隐单元个数是512
+    # 8个Transformer block，每个block有8个Attention Head，全连接层的隐单元是1024
     config = modeling.BertConfig(vocab_size=32000, hidden_size=512,
       num_hidden_layers=8, num_attention_heads=6, intermediate_size=1024)
 
+    # 创建BertModel
     model = modeling.BertModel(config=config, is_training=True,
       input_ids=input_ids, input_mask=input_mask, token_type_ids=token_type_ids)
 
+    # label_embeddings用于把512的隐单元变换成logits
     label_embeddings = tf.get_variable(...)
+
+    # 得到[CLS]最后一层输出，把它看成句子的Embedding(Encoding)
     pooled_output = model.get_pooled_output()
+
+    # 计算logits
     logits = tf.matmul(pooled_output, label_embeddings)
     ...
     ```
@@ -177,31 +203,34 @@ class BertModel(object):
 
         Args:
           config: `BertConfig` instance.
-
+             `BertConfig` 对象
 
           is_training: bool. true for training model, false for eval model. Controls
             whether dropout will be applied.
-
+            bool 表示训练还是eval，是会影响dropout
 
           input_ids: int32 Tensor of shape [batch_size, seq_length].
-
+            input_ids: int32 Tensor  shape是[batch_size, seq_length]
 
           input_mask: (optional) int32 Tensor of shape [batch_size, seq_length].
-
+            input_mask: (可选) int32 Tensor shape是[batch_size, seq_length]
 
           token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
-
+            token_type_ids: (可选) int32 Tensor shape是[batch_size, seq_length]
 
           use_one_hot_embeddings: (optional) bool. Whether to use one-hot word
             embeddings or tf.embedding_lookup() for the word embeddings.
-
+            (可选) bool
+            如果True，使用矩阵乘法实现提取词的Embedding；否则用tf.embedding_lookup()
+            对于TPU，使用前者更快，对于GPU和CPU，后者更快。
 
           scope: (optional) variable scope. Defaults to "bert".
-
+            scope: (可选) 变量的scope。默认是"bert"
 
         Raises:
           ValueError: The config is invalid or one of the input tensor shapes
             is invalid.
+            ValueError: 如果config或者输入tensor的shape有问题就会抛出这个异常
         """
         config = copy.deepcopy(config)
         if not is_training:
@@ -212,15 +241,19 @@ class BertModel(object):
         batch_size = input_shape[0]
         seq_length = input_shape[1]
 
+        # 如果输入的input_mask为None，那么构造一个shape合适值全为1的input_mask，
+        # 这表示输入都是”真实”的输入，没有padding的内容。
         if input_mask is None:
             input_mask = tf.ones(shape=[batch_size, seq_length], dtype=tf.int32)
 
+        # 如果token_type_ids为None，那么构造一个shape合适并且值全为0的tensor，表示所有Token都属于第一个句子。
         if token_type_ids is None:
             token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
 
         with tf.variable_scope(scope, default_name="bert"):
             with tf.variable_scope("embeddings"):
                 # Perform embedding lookup on the word ids.
+                # 词的Embedding lookup
                 (self.embedding_output, self.embedding_table) = embedding_lookup(
                     input_ids=input_ids,
                     vocab_size=config.vocab_size,
@@ -231,6 +264,7 @@ class BertModel(object):
 
                 # Add positional embeddings and token type embeddings, then layer
                 # normalize and perform dropout.
+                # 增加位置embeddings和token type的embeddings，然后是layer normalize和dropout。
                 self.embedding_output = embedding_postprocessor(
                     input_tensor=self.embedding_output,
                     use_token_type=True,
@@ -247,11 +281,21 @@ class BertModel(object):
                 # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
                 # mask of shape [batch_size, seq_length, seq_length] which is used
                 # for the attention scores.
+                # 把shape为[batch_size, seq_length]的2D mask变成
+                # shape为[batch_size, seq_length, seq_length]的3D mask
+                # 以便后向的attention计算，读者可以对比之前的Transformer的代码。
                 attention_mask = create_attention_mask_from_input_mask(
                     input_ids, input_mask)
 
+                # 接着用transformer_model函数构造多个Transformer
+                # SubLayer然后stack在一起。得到的all_encoder_layers是一个list，
+                # 长度为num_hidden_layers（默认12），每一层对应一个值。
+                # 每一个值都是一个shape为[batch_size, seq_length, hidden_size]的tensor。
+
                 # Run the stacked transformer.
-                # `sequence_output` shape = [batch_size, seq_length, hidden_size].
+                # 多个Transformer模型stack起来。
+                # all_encoder_layers是一个list，长度为num_hidden_layers（默认12），每一层对应一个值。
+                # 每一个值都是一个shape为[batch_size, seq_length, hidden_size]的tensor。
                 self.all_encoder_layers = transformer_model(
                     input_tensor=self.embedding_output,
                     attention_mask=attention_mask,
@@ -265,16 +309,29 @@ class BertModel(object):
                     initializer_range=config.initializer_range,
                     do_return_all_layers=True)
 
+            # 最后对self.sequence_output再加一个线性变换，得到的tensor仍然是[batch_size, hidden_size]。
+            # `sequence_output`是最后一层的输出 shape = [batch_size, seq_length, hidden_size].
             self.sequence_output = self.all_encoder_layers[-1]
+
             # The "pooler" converts the encoded sequence tensor of shape
             # [batch_size, seq_length, hidden_size] to a tensor of shape
             # [batch_size, hidden_size]. This is necessary for segment-level
             # (or segment-pair-level) classification tasks where we need a fixed
             # dimensional representation of the segment.
+
+            # ‘pooler’部分将encoder输出【batch_size, seq_length, hidden_size】
+            # 转成【batch_size, hidden_size】
             with tf.variable_scope("pooler"):
                 # We "pool" the model by simply taking the hidden state corresponding
                 # to the first token. We assume that this has been pre-trained
+                # 取最后一层的第一个时刻[CLS]对应的tensor， 对于分类任务很重要
+                # 从[batch_size, seq_length, hidden_size]变成[batch_size, hidden_size]
+                # sequence_output[:, 0:1, :]得到的是[batch_size, 1, hidden_size]
+                # 我们需要用squeeze把第二维去掉。
+                # first_token_tensor是第一个Token([CLS])
+                # 最后一层的输出，shape是[batch_size, hidden_size]。
                 first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
+                # 然后再加一个全连接层，输出仍然是[batch_size, hidden_size]
                 self.pooled_output = tf.layers.dense(
                     first_token_tensor,
                     config.hidden_size,
@@ -443,7 +500,7 @@ def create_initializer(initializer_range=0.02):
     return tf.truncated_normal_initializer(stddev=initializer_range)
 
 
-# 获取词向量
+# 2、获取词向量 对于输入word_ids，返回embedding table。可以选用one-hot或者tf.gather()
 def embedding_lookup(input_ids,
                      vocab_size,
                      embedding_size=128,
@@ -454,7 +511,6 @@ def embedding_lookup(input_ids,
     Looks up words embeddings for id tensor.
     查找id张量的词嵌入。
 
-    对于输入word_ids，返回embedding table。可以选用one-hot或者tf.gather()
     Args:
       input_ids: int32 Tensor of shape [batch_size, seq_length] containing word
         ids.
@@ -516,7 +572,7 @@ def embedding_lookup(input_ids,
     return (output, embedding_table)
 
 
-# 词向量的后续处理
+# 3、词向量的后续处理
 def embedding_postprocessor(input_tensor,  # [batch_size, seq_length, embedding_size]
                             use_token_type=False,
                             token_type_ids=None,
@@ -655,7 +711,7 @@ def embedding_postprocessor(input_tensor,  # [batch_size, seq_length, embedding_
     return output
 
 
-# 构造attention_mask 构造Mask矩阵
+# 4、构造attention_mask 构造Mask矩阵
 def create_attention_mask_from_input_mask(from_tensor, to_mask):
     """
     Create 3D attention mask from a 2D tensor mask.
@@ -722,7 +778,7 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
     return mask
 
 
-# 注意力层
+# 5、注意力层
 def attention_layer(from_tensor,
                     to_tensor,
                     attention_mask=None,
@@ -1006,7 +1062,7 @@ def attention_layer(from_tensor,
     return context_layer
 
 
-# Transformer
+# 6、Transformer
 def transformer_model(input_tensor,
                       attention_mask=None,
                       hidden_size=768,
