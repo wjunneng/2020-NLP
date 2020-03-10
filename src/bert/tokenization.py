@@ -165,6 +165,7 @@ def convert_ids_to_tokens(inv_vocab, ids):
 
 
 # 按照空格进行切割
+# 这里的whitespace 包含了 \t\n\x0b\x0c\r
 def whitespace_tokenize(text):
     """Runs basic whitespace cleaning and splitting on a piece of text."""
     text = text.strip()
@@ -181,7 +182,9 @@ class FullTokenizer(object):
     def __init__(self, vocab_file, do_lower_case=True):
         self.vocab = load_vocab(vocab_file)
         self.inv_vocab = {v: k for k, v in self.vocab.items()}
+        # 根据空格进行普通的分词
         self.basic_tokenizer = BasicTokenizer(do_lower_case=do_lower_case)
+        # 对前面分好的词进行更加细粒度的分词
         self.wordpiece_tokenizer = WordpieceTokenizer(vocab=self.vocab)
 
     def tokenize(self, text):
@@ -315,6 +318,7 @@ class BasicTokenizer(object):
         """Performs invalid character removal and whitespace cleanup on text."""
         output = []
         for char in text:
+            # codepoint
             cp = ord(char)
             if cp == 0 or cp == 0xfffd or _is_control(char):
                 continue
@@ -416,6 +420,7 @@ def _is_control(char):
     """Checks whether `chars` is a control character."""
     # These are technically control characters but we count them as whitespace
     # characters.
+    # 回车换行和tab理论上是控制字符, 但是这里我们把他们认为是whitespace而不是控制字符
     if char == "\t" or char == "\n" or char == "\r":
         return False
     cat = unicodedata.category(char)
