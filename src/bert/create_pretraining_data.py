@@ -127,6 +127,7 @@ class TrainingInstance(object):
         return self.__str__()
 
 
+# 将处理好的数据保存为tf_record
 def write_instance_to_example_files(instances, tokenizer, max_seq_length,
                                     max_predictions_per_seq, output_files):
     """Create TF example files from `TrainingInstance`s."""
@@ -152,8 +153,11 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length,
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
 
+        # 记录被mask掉的token在字符串中的位置
         masked_lm_positions = list(instance.masked_lm_positions)
+        # 记录被mask掉的token对应的token id
         masked_lm_ids = tokenizer.convert_tokens_to_ids(instance.masked_lm_labels)
+        # 有mask的位置为1, 没有为0
         masked_lm_weights = [1.0] * len(masked_lm_ids)
 
         while len(masked_lm_positions) < max_predictions_per_seq:
@@ -172,13 +176,15 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length,
         features["masked_lm_weights"] = create_float_feature(masked_lm_weights)
         features["next_sentence_labels"] = create_int_feature([next_sentence_label])
 
+        # 生成训练样本
         tf_example = tf.train.Example(features=tf.train.Features(feature=features))
-
+        # 输出到文件中 将example数据序列化为字符串
         writers[writer_index].write(tf_example.SerializeToString())
         writer_index = (writer_index + 1) % len(writers)
 
         total_written += 1
 
+        # 打印前面20条数据
         if inst_index < 20:
             tf.logging.info("*** Example ***")
             tf.logging.info("tokens: %s" % " ".join(
@@ -200,11 +206,13 @@ def write_instance_to_example_files(instances, tokenizer, max_seq_length,
     tf.logging.info("Wrote %d total instances", total_written)
 
 
+# train int feature
 def create_int_feature(values):
     feature = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
     return feature
 
 
+# train float feature
 def create_float_feature(values):
     feature = tf.train.Feature(float_list=tf.train.FloatList(value=list(values)))
     return feature

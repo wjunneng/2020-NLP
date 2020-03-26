@@ -19,8 +19,8 @@ from __future__ import division
 from __future__ import print_function
 
 import os
-import modeling
-import optimization
+from src.bert import modeling
+from src.bert import optimization
 import tensorflow as tf
 
 flags = tf.flags
@@ -106,12 +106,14 @@ flags.DEFINE_integer(
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
 
+# 用于构造Estimator使用的model_fn, 定义好输入函数‘两个无监督训练任务’
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
                      use_one_hot_embeddings):
     """Returns `model_fn` closure for TPUEstimator."""
 
-    def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
+    # pylint: disable=unused-argument
+    def model_fn(features, labels, mode, params):
         """The `model_fn` for TPUEstimator."""
 
         tf.logging.info("*** Features ***")
@@ -128,6 +130,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
         is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
+        # 创建transformer实例对象
         model = modeling.BertModel(
             config=bert_config,
             is_training=is_training,
@@ -136,24 +139,27 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
             token_type_ids=segment_ids,
             use_one_hot_embeddings=use_one_hot_embeddings)
 
-        (masked_lm_loss,
-         masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
+        # 获得mlm任务的批损失, 平均损失以及预测概率矩阵
+        (masked_lm_loss, masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
             bert_config, model.get_sequence_output(), model.get_embedding_table(),
             masked_lm_positions, masked_lm_ids, masked_lm_weights)
 
-        (next_sentence_loss, next_sentence_example_loss,
-         next_sentence_log_probs) = get_next_sentence_output(
-            bert_config, model.get_pooled_output(), next_sentence_labels)
+        # 获得nsp任务的批损失, 平均损失以及预测概率矩阵
+        (next_sentence_loss, next_sentence_example_loss, next_sentence_log_probs) = \
+            get_next_sentence_output(bert_config, model.get_pooled_output(), next_sentence_labels)
 
+        # 两种任务loss相加
         total_loss = masked_lm_loss + next_sentence_loss
 
+        # 获取所有变量
         tvars = tf.trainable_variables()
 
         initialized_variable_names = {}
         scaffold_fn = None
+        # 如果有之前保存的模型,则进行恢复
         if init_checkpoint:
-            (assignment_map, initialized_variable_names
-             ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+            (assignment_map, initialized_variable_names) = \
+                modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
             if use_tpu:
 
                 def tpu_scaffold():
@@ -173,6 +179,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                             init_string)
 
         output_spec = None
+        # 训练过程, 获得spec
         if mode == tf.estimator.ModeKeys.TRAIN:
             train_op = optimization.create_optimizer(
                 total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
@@ -182,12 +189,14 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                 loss=total_loss,
                 train_op=train_op,
                 scaffold_fn=scaffold_fn)
+        # 验证过程spec
         elif mode == tf.estimator.ModeKeys.EVAL:
 
             def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
                           masked_lm_weights, next_sentence_example_loss,
                           next_sentence_log_probs, next_sentence_labels):
                 """Computes the loss and accuracy of the model."""
+                # 计算损失和准确率
                 masked_lm_log_probs = tf.reshape(masked_lm_log_probs,
                                                  [-1, masked_lm_log_probs.shape[-1]])
                 masked_lm_predictions = tf.argmax(
@@ -237,14 +246,19 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     return model_fn
 
 
+# 训练MASKED LM任务的loss
+# input_tensor为BertModel的最后一层sequence_output的输出([batch_size, sequence_length, hidden_size]), 因为对一个序列的mask
+# 标记的预测属于标注问题,需要整个sequence的输出状态
 def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
                          label_ids, label_weights):
     """Get loss and log probs for the masked LM."""
+    # 获取mask位置的encode 编码向量 [mask_token_size, hidden_size]
     input_tensor = gather_indexes(input_tensor, positions)
 
     with tf.variable_scope("cls/predictions"):
         # We apply one more non-linear transformation before the output layer.
         # This matrix is not used after pre-training.
+        # 在输出之间添加一个非线性变换，只在预训练阶段起作用
         with tf.variable_scope("transform"):
             input_tensor = tf.layers.dense(
                 input_tensor,
@@ -256,17 +270,25 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
 
         # The output weights are the same as the input embeddings, but there is
         # an output-only bias for each token.
+        # ouput_weights是和传入的word embedding一样的，这里添加一个bias
         output_bias = tf.get_variable(
             "output_bias",
             shape=[bert_config.vocab_size],
             initializer=tf.zeros_initializer())
+
+        # [mask_token_size, hidden_size] * [vocab_size, hidden_size].T
         logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
+        # 加上bias
         logits = tf.nn.bias_add(logits, output_bias)
+        # 加上log softmax 得到[mask_token_size, vocab_size]
         log_probs = tf.nn.log_softmax(logits, axis=-1)
 
+        # 记录被mask掉的token对应的token id 也就是y_label
         label_ids = tf.reshape(label_ids, [-1])
+        # 有mask的位置为1, 没有为0
         label_weights = tf.reshape(label_weights, [-1])
 
+        # 得到[mask_token_size, vocab_size] 取值在0/1之间的矩阵
         one_hot_labels = tf.one_hot(
             label_ids, depth=bert_config.vocab_size, dtype=tf.float32)
 
@@ -274,19 +296,28 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
         # short to have the maximum number of predictions). The `label_weights`
         # tensor has a value of 1.0 for every real prediction and 0.0 for the
         # padding predictions.
+        # 由于实际mask的可能不到20, 比如只mask18, 那么label_ids有两个0(padding)
+        # 而label_weight=[1, 1, ..., 0, 0]，说明后面两个label_id是padding的，计算的loss要去掉
         per_example_loss = -tf.reduce_sum(log_probs * one_hot_labels, axis=[-1])
+        # 计算有效的损失
         numerator = tf.reduce_sum(label_weights * per_example_loss)
         denominator = tf.reduce_sum(label_weights) + 1e-5
+        # 平均损失
         loss = numerator / denominator
 
     return (loss, per_example_loss, log_probs)
 
 
+# 计算NSP训练的loss损失
+# input_tensor为BertModel的最后一层pooled_output输出([batch_size, hidden_size])
+# 因为该任务是属于二分类问题，所以只需要每个序列的第一个token[cls]即可.
 def get_next_sentence_output(bert_config, input_tensor, labels):
     """Get loss and log probs for the next sentence prediction."""
 
     # Simple binary classification. Note that 0 is "next sentence" and 1 is
     # "random sentence". This weight matrix is not used after pre-training.
+    # 标签0表示下一个句子与上一个句子是上下文关系, 1则是随机生成的
+    # 这个分类器的参数在实际上Fine-tuning阶段会丢弃掉
     with tf.variable_scope("cls/seq_relationship"):
         output_weights = tf.get_variable(
             "output_weights",
@@ -302,22 +333,28 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
         one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
         per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
         loss = tf.reduce_mean(per_example_loss)
+
         return (loss, per_example_loss, log_probs)
 
 
+# 计算指定位置下的token encode输出
 def gather_indexes(sequence_tensor, positions):
     """Gathers the vectors at the specific positions over a minibatch."""
+    # [batch_size, sequence_size, hidden_size]
     sequence_shape = modeling.get_shape_list(sequence_tensor, expected_rank=3)
     batch_size = sequence_shape[0]
     seq_length = sequence_shape[1]
     width = sequence_shape[2]
 
-    flat_offsets = tf.reshape(
-        tf.range(0, batch_size, dtype=tf.int32) * seq_length, [-1, 1])
+    # 步长为seq_length, 个数为batch_size
+    flat_offsets = tf.reshape(tf.range(0, batch_size, dtype=tf.int32) * seq_length, [-1, 1])
+    # 指定位置加上步长[batch_size存在的缘故]
     flat_positions = tf.reshape(positions + flat_offsets, [-1])
-    flat_sequence_tensor = tf.reshape(sequence_tensor,
-                                      [batch_size * seq_length, width])
+    # 更改sequence_tensor
+    flat_sequence_tensor = tf.reshape(sequence_tensor, [batch_size * seq_length, width])
+    # [batch_size * seq_length, width]
     output_tensor = tf.gather(flat_sequence_tensor, flat_positions)
+
     return output_tensor
 
 
@@ -403,6 +440,7 @@ def _decode_record(record, name_to_features):
     return example
 
 
+# 主函数
 def main(_):
     tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -437,6 +475,7 @@ def main(_):
             num_shards=FLAGS.num_tpu_cores,
             per_host_input_for_training=is_per_host))
 
+    # 自定义模型用于estimator训练
     model_fn = model_fn_builder(
         bert_config=bert_config,
         init_checkpoint=FLAGS.init_checkpoint,
@@ -448,6 +487,7 @@ def main(_):
 
     # If TPU is not available, this will fall back to normal Estimator on CPU
     # or GPU.
+    # 如果没有tpu，会自动转为cpu/gpu的Estimator
     estimator = tf.contrib.tpu.TPUEstimator(
         use_tpu=FLAGS.use_tpu,
         model_fn=model_fn,
@@ -487,6 +527,7 @@ def main(_):
 
 
 if __name__ == "__main__":
+    # 将对应的命令行参数标记为必需的
     flags.mark_flag_as_required("input_file")
     flags.mark_flag_as_required("bert_config_file")
     flags.mark_flag_as_required("output_dir")
