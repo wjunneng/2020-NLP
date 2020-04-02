@@ -21,10 +21,11 @@ from __future__ import print_function
 import collections
 import csv
 import os
-import modeling
-import optimization
-import tokenization
 import tensorflow as tf
+
+from src.bert import tokenization
+from src.bert import modeling
+from src.bert import optimization
 
 flags = tf.flags
 
@@ -174,6 +175,7 @@ class InputFeatures(object):
         self.is_real_example = is_real_example
 
 
+# 抽象基类
 class DataProcessor(object):
     """Base class for data converters for sequence classification data sets."""
 
@@ -252,6 +254,10 @@ class XnliProcessor(DataProcessor):
         return ["contradiction", "entailment", "neutral"]
 
 
+# 子类 line类型为list
+# 对于所有的字符串都使用tokenization.convert_to_unicode把字符串变成unicode的字符串
+# 这是为了兼容python2 和 python3
+# 因为python3的str是unicode, 而python2的str是bytearray. python2 有一个专门的unicode类型
 class MnliProcessor(DataProcessor):
     """Processor for the MultiNLI data set (GLUE version)."""
 
@@ -293,6 +299,8 @@ class MnliProcessor(DataProcessor):
         return examples
 
 
+# 子类 line类型为list
+# 对于所有的字符串都使用tokenization.convert_to_unicode把字符串变成unicode的字符串
 class MrpcProcessor(DataProcessor):
     """Processor for the MRPC data set (GLUE version)."""
 
@@ -315,6 +323,7 @@ class MrpcProcessor(DataProcessor):
         """See base class."""
         return ["0", "1"]
 
+    # 将每一行变成一个InputExample对象
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
@@ -333,6 +342,8 @@ class MrpcProcessor(DataProcessor):
         return examples
 
 
+# 子类 line类型为list
+# 对于所有的字符串都使用tokenization.convert_to_unicode把字符串变成unicode的字符串
 class ColaProcessor(DataProcessor):
     """Processor for the CoLA data set (GLUE version)."""
 
@@ -374,8 +385,8 @@ class ColaProcessor(DataProcessor):
         return examples
 
 
-def convert_single_example(ex_index, example, label_list, max_seq_length,
-                           tokenizer):
+# 将每一个InputExample转化为InputFeature
+def convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer):
     """Converts a single `InputExample` into a single `InputFeatures`."""
 
     if isinstance(example, PaddingInputExample):
@@ -399,9 +410,12 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
         # Modifies `tokens_a` and `tokens_b` in place so that the total
         # length is less than the specified length.
         # Account for [CLS], [SEP], [SEP] with "- 3"
+        # 如果有b, 那么需要保留3个特殊的Token[CLS]/[SEP]/[SEP]
+        # 如果两个序列加起来太长，就去掉一些
         _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 3)
     else:
         # Account for [CLS] and [SEP] with "- 2"
+        # 没有b, 那么就保留[CLS]和[SEP]两个字符
         if len(tokens_a) > max_seq_length - 2:
             tokens_a = tokens_a[0:(max_seq_length - 2)]
 
@@ -419,7 +433,11 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
     # embedding vector (and position vector). This is not *strictly* necessary
     # since the [SEP] token unambiguously separates the sequences, but it makes
     # it easier for the model to learn the concept of sequences.
-    #
+    # 对于type=0和type=1,模型会学习出两个Embedding向量, 虽然理论上是不必要的，因为[SEP]
+    # 隐式的确定了两个字符串的边界, 但是实际上加上了type后, 模型更加确定了某个字符是否属于
+    # 哪个字符串
+    # 对于分类任务, [CLS]对应的向量可以被看成'sentence vector'
+    # 注意：一定需要Fine-Tuning之后才有意义
     # For classification tasks, the first vector (corresponding to [CLS]) is
     # used as the "sentence vector". Note that this only makes sense because
     # the entire model is fine-tuned.
@@ -444,6 +462,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 
     # The mask has 1 for real tokens and 0 for padding tokens. Only real
     # tokens are attended to.
+    # mask 为1表示'真正的'mask, 0则是padding出来的
     input_mask = [1] * len(input_ids)
 
     # Zero-pad up to the sequence length.
@@ -476,6 +495,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
     return feature
 
 
+# 将输入的tsv文件保存为tf-record文件
 def file_based_convert_examples_to_features(
         examples, label_list, max_seq_length, tokenizer, output_file):
     """Convert a set of `InputExample`s to a TFRecord file."""
@@ -486,9 +506,11 @@ def file_based_convert_examples_to_features(
         if ex_index % 10000 == 0:
             tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
 
+        # 将每一个InputExample转化为InputFeature
         feature = convert_single_example(ex_index, example, label_list,
                                          max_seq_length, tokenizer)
 
+        # 因为input_ids, input_mask, segment_ids, label_id 中除了label_id是int属性，其他的都是int的list.
         def create_int_feature(values):
             f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
             return f
@@ -502,10 +524,12 @@ def file_based_convert_examples_to_features(
             [int(feature.is_real_example)])
 
         tf_example = tf.train.Example(features=tf.train.Features(feature=features))
+        # 序列化为字符串，写入到文件中
         writer.write(tf_example.SerializeToString())
     writer.close()
 
 
+# 构造input_fn
 def file_based_input_fn_builder(input_file, seq_length, is_training,
                                 drop_remainder):
     """Creates an `input_fn` closure to be passed to TPUEstimator."""
@@ -520,10 +544,13 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
     def _decode_record(record, name_to_features):
         """Decodes a record to a TensorFlow example."""
+        # 把tfrecord decode成Tensorflow example
         example = tf.parse_single_example(record, name_to_features)
 
         # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
         # So cast all int64 to int32.
+        # tf.Example支持tf.int64, 但是TPU只支持tf.int32
+        # 将所有的int64转int32
         for name in list(example.keys()):
             t = example[name]
             if t.dtype == tf.int64:
@@ -538,6 +565,8 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
 
         # For training, we want a lot of parallel reading and shuffling.
         # For eval, we want no shuffling and parallel reading doesn't matter.
+        # 对于训练集，需要重复的读取和打乱
+        # 对于验证集，我们不需要shuffling和并行读取
         d = tf.data.TFRecordDataset(input_file)
         if is_training:
             d = d.repeat()
@@ -554,6 +583,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
     return input_fn
 
 
+# 截断序列
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
     """Truncates a sequence pair in place to the maximum length."""
 
@@ -571,6 +601,7 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
             tokens_b.pop()
 
 
+# 创建“真正”的Transformer模型
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
                  labels, num_labels, use_one_hot_embeddings):
     """Creates a classification model."""
@@ -790,8 +821,7 @@ def main(_):
         "xnli": XnliProcessor,
     }
 
-    tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case,
-                                                  FLAGS.init_checkpoint)
+    tokenization.validate_case_matches_checkpoint(FLAGS.do_lower_case, FLAGS.init_checkpoint)
 
     if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_predict:
         raise ValueError(
